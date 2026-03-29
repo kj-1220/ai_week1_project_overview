@@ -1,0 +1,10 @@
+# Data Generator
+faker>=22.0.0
+
+# EDA Notebooks
+jupyter>=1.0.0
+pandas>=2.0.0
+plotly>=5.18.0
+
+# Streamlit Dashboard
+streamlit>=1.30.0

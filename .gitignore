@@ -1,0 +1,17 @@
+otacon.db
+otacon.db-wal
+otacon.db-shm
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+gcloud init/
+otacon_inc/
