@@ -1,59 +1,54 @@
 """
 db.py — Database connection and query helpers for the Otacon dashboard.
-BigQuery version — queries GCP instead of local SQLite.
+SQLite version — queries local otacon.db.
 """
-
 import streamlit as st
 import pandas as pd
 import os
+import sqlite3
 
-GCP_PROJECT = os.environ.get("GCP_PROJECT", "otacon-inc")
-BQ_DATASET = os.environ.get("BQ_DATASET", "otacon")
-
+DB_PATH = os.environ.get("OTACON_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "otacon.db"))
 
 @st.cache_resource
-def get_client():
-    """Singleton BigQuery client."""
-    from google.cloud import bigquery
-    return bigquery.Client(project=GCP_PROJECT)
-
+def get_conn():
+    """Singleton SQLite connection."""
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def _tbl(name):
-    """Return fully qualified BigQuery table name."""
-    return f"`{GCP_PROJECT}.{BQ_DATASET}.{name}`"
-
+    """Return table name. Kept for compatibility so page files don't change."""
+    return name
 
 @st.cache_data(ttl=600, show_spinner=False)
 def q(sql):
     """Run a query and return a DataFrame. Cached for 10 minutes."""
-    return get_client().query(sql).to_dataframe()
-
+    return pd.read_sql_query(sql, get_conn())
 
 def metric_card(col, label, value, subtitle=None):
-    """Render a single metric in a column."""
     if subtitle:
         col.metric(label, value, subtitle)
     else:
         col.metric(label, value)
 
-
 def governance_sidebar(raw_table, clean_view, flag_tables=None):
-    """Data quality info in the sidebar."""
     with st.sidebar.expander("Data Quality"):
-        raw_n = q(f"SELECT COUNT(*) as n FROM {_tbl(raw_table)}").n[0]
-        clean_n = q(f"SELECT COUNT(*) as n FROM {_tbl(clean_view)}").n[0]
+        counts = q(f"""
+            SELECT
+                (SELECT COUNT(*) FROM {raw_table}) as raw_n,
+                (SELECT COUNT(*) FROM {clean_view}) as clean_n
+        """)
+        raw_n = counts.raw_n[0]
+        clean_n = counts.clean_n[0]
         excluded = raw_n - clean_n
         st.caption(f"**{raw_table}**: {raw_n:,} raw | {clean_n:,} clean | {excluded:,} excluded")
         if flag_tables:
-            for tbl in flag_tables:
-                flags = q(f"""
-                    SELECT rule_id, flag_type, COUNT(*) as n
-                    FROM {_tbl('data_quality_flags')} WHERE table_name = '{tbl}'
-                    GROUP BY rule_id, flag_type ORDER BY rule_id
-                """)
-                if not flags.empty:
-                    st.dataframe(flags, use_container_width=True, hide_index=True)
-
+            tbl_list = ", ".join(f"'{t}'" for t in flag_tables)
+            flags = q(f"""
+                SELECT rule_id, flag_type, COUNT(*) as n
+                FROM data_quality_flags WHERE table_name IN ({tbl_list})
+                GROUP BY rule_id, flag_type ORDER BY rule_id
+            """)
+            if not flags.empty:
+                st.dataframe(flags, use_container_width=True, hide_index=True)
 
 # ── Chart defaults ──
 COLORS = {
@@ -66,7 +61,6 @@ COLORS = {
     "light_gray": "#d1d5db",
     "dark": "#1e293b",
 }
-
 REGION_COLORS = {
     "North America": "#2563eb",
     "Europe": "#16a34a",
@@ -74,13 +68,11 @@ REGION_COLORS = {
     "LATAM": "#dc2626",
     "Unknown": "#6b7280",
 }
-
 SEGMENT_COLORS = {
     "enterprise": "#7c3aed",
     "mid_market": "#2563eb",
     "smb": "#16a34a",
 }
-
 CHART_LAYOUT = dict(
     font=dict(family="Inter, system-ui, sans-serif", size=12, color="#374151"),
     plot_bgcolor="white",
@@ -90,10 +82,7 @@ CHART_LAYOUT = dict(
     xaxis=dict(gridcolor="#f3f4f6", linecolor="#e5e7eb"),
     yaxis=dict(gridcolor="#f3f4f6", linecolor="#e5e7eb"),
 )
-
-
 def style_fig(fig, height=400, **kwargs):
-    """Apply consistent styling to a Plotly figure."""
     layout = {**CHART_LAYOUT, "height": height, **kwargs}
     fig.update_layout(**layout)
     return fig

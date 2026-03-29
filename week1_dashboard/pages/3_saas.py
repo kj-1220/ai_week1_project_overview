@@ -10,12 +10,15 @@ from plotly.subplots import make_subplots
 st.markdown("## SaaS and MRR")
 st.caption("Subscriptions, MRR movements, churn, support | Clean views")
 
-# ── KPIs ──
-total = q(f"SELECT COUNT(*) as v FROM {_tbl('v_saas_customers_clean')}").v[0]
-active = q(f"SELECT COUNT(*) as v FROM {_tbl('v_saas_customers_clean')} WHERE status='active'").v[0]
-churned = q(f"SELECT COUNT(*) as v FROM {_tbl('v_saas_customers_clean')} WHERE status='churned'").v[0]
-mrr = q(f"SELECT SUM(mrr) as v FROM {_tbl('v_saas_customers_clean')} WHERE status='active'").v[0]
-avg_usage = q(f"SELECT AVG(usage_score) as v FROM {_tbl('v_saas_customers_clean')} WHERE status='active'").v[0]
+# ── Query 1: All SaaS customers ──
+saas = q("SELECT status, plan_tier, mrr, usage_score FROM v_saas_customers_clean")
+
+total = len(saas)
+active_mask = saas.status == "active"
+active = active_mask.sum()
+churned = (saas.status == "churned").sum()
+mrr = saas.loc[active_mask, "mrr"].sum()
+avg_usage = saas.loc[active_mask, "usage_score"].mean()
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Subscribers", f"{total:,}")
@@ -26,13 +29,17 @@ c5.metric("Avg Usage Score", f"{avg_usage:.0f}")
 
 st.divider()
 
-# ── 1. MRR movements by quarter ──
-mrr_data = q(f"""
-    SELECT CONCAT(CAST(EXTRACT(YEAR FROM SAFE_CAST(movement_date AS DATE)) AS STRING), '-Q',
-                  CAST(EXTRACT(QUARTER FROM SAFE_CAST(movement_date AS DATE)) AS STRING)) as quarter,
-           movement_type, SUM(amount) as total
-    FROM {_tbl('mrr_movements')} GROUP BY quarter, movement_type ORDER BY quarter
+# ── Query 2: MRR movements ──
+mrr_raw = q("""
+    SELECT movement_date,
+           strftime('%Y-%m', movement_date) as month,
+           strftime('%Y', movement_date) || '-Q' || ((CAST(strftime('%m', movement_date) AS INTEGER) - 1) / 3 + 1) as quarter,
+           movement_type, amount
+    FROM mrr_movements
 """)
+
+# ── 1. MRR movements by quarter ──
+mrr_data = mrr_raw.groupby(["quarter", "movement_type"], as_index=False).agg(total=("amount", "sum"))
 pivot = mrr_data.pivot_table(index="quarter", columns="movement_type", values="total", aggfunc="sum").fillna(0)
 if "churn" in pivot.columns:
     pivot["churn"] = -abs(pivot["churn"])
@@ -60,12 +67,11 @@ st.plotly_chart(fig, use_container_width=True)
 col1, col2 = st.columns(2)
 
 with col1:
-    churn_mo = q(f"""
-        SELECT FORMAT_DATE('%Y-%m', SAFE_CAST(movement_date AS DATE)) as month,
-               COUNT(*) as churns, SUM(ABS(amount)) as lost_mrr
-        FROM {_tbl('mrr_movements')} WHERE movement_type = 'churn'
-        GROUP BY month ORDER BY month
-    """)
+    churn_data = mrr_raw[mrr_raw.movement_type == "churn"]
+    churn_mo = churn_data.groupby("month", as_index=False).agg(
+        churns=("amount", "count"),
+        lost_mrr=("amount", lambda x: x.abs().sum())
+    )
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Bar(x=churn_mo.month, y=churn_mo.churns, name="Churns",
                          marker_color=COLORS["red"], opacity=0.7), secondary_y=False)
@@ -78,11 +84,11 @@ with col1:
     st.plotly_chart(fig, use_container_width=True)
 
 with col2:
-    tenure = q(f"""
-        SELECT DATE_DIFF(SAFE_CAST(m.movement_date AS DATE), SAFE_CAST(s.signup_date AS DATE), DAY) / 30 as months,
+    tenure = q("""
+        SELECT CAST((julianday(m.movement_date) - julianday(s.signup_date)) / 30 AS INTEGER) as months,
                COUNT(*) as churns
-        FROM {_tbl('mrr_movements')} m
-        JOIN {_tbl('saas_customers')} s ON m.saas_customer_id = s.saas_customer_id
+        FROM mrr_movements m
+        JOIN saas_customers s ON m.saas_customer_id = s.saas_customer_id
         WHERE m.movement_type = 'churn'
         GROUP BY months HAVING months BETWEEN 1 AND 36 ORDER BY months
     """)
@@ -101,10 +107,7 @@ st.divider()
 col1, col2 = st.columns(2)
 
 with col1:
-    plan = q(f"""
-        SELECT plan_tier, status, COUNT(*) as n
-        FROM {_tbl('v_saas_customers_clean')} GROUP BY plan_tier, status ORDER BY plan_tier
-    """)
+    plan = saas.groupby(["plan_tier", "status"]).size().reset_index(name="n")
     fig = px.bar(plan, x="plan_tier", y="n", color="status", barmode="stack",
                  color_discrete_map={"active": COLORS["green"], "churned": COLORS["red"]})
     style_fig(fig, height=350, title_text="Subscribers by Plan and Status")
@@ -112,40 +115,40 @@ with col1:
     st.plotly_chart(fig, use_container_width=True)
 
 with col2:
-    usage = q(f"SELECT usage_score, status FROM {_tbl('v_saas_customers_clean')}")
-    fig = px.histogram(usage, x="usage_score", color="status", barmode="overlay",
+    fig = px.histogram(saas, x="usage_score", color="status", barmode="overlay",
                        nbins=40, opacity=0.7,
                        color_discrete_map={"active": COLORS["green"], "churned": COLORS["red"]})
     style_fig(fig, height=350, title_text="Usage Score Distribution by Status")
     fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
     st.plotly_chart(fig, use_container_width=True)
 
-# ── 6 & 7. Support tickets ──
+# ── Query 3: Support tickets ──
 st.divider()
 col1, col2 = st.columns(2)
 
+tickets = q("""
+    SELECT strftime('%Y-%m', created_date) as month,
+           priority, category, resolution_hours
+    FROM v_support_tickets_clean
+""")
+
 with col1:
-    tickets = q(f"""
-        SELECT FORMAT_DATE('%Y-%m', SAFE_CAST(created_date AS DATE)) as month,
-               priority, COUNT(*) as n
-        FROM {_tbl('v_support_tickets_clean')} GROUP BY month, priority ORDER BY month
-    """)
-    fig = px.area(tickets, x="month", y="n", color="priority",
-                  color_discrete_map={{"critical":COLORS["red"], "high":COLORS["orange"],
-                                       "medium":"#eab308", "low":COLORS["green"]}})
+    tk_mo = tickets.groupby(["month", "priority"]).size().reset_index(name="n")
+    fig = px.area(tk_mo, x="month", y="n", color="priority",
+                  color_discrete_map={"critical": COLORS["red"], "high": COLORS["orange"],
+                                      "medium": "#eab308", "low": COLORS["green"]})
     style_fig(fig, height=350, title_text="Monthly Support Tickets by Priority")
     fig.update_xaxes(dtick=3)
     fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
     st.plotly_chart(fig, use_container_width=True)
 
 with col2:
-    res = q(f"""
-        SELECT category, COUNT(*) as tickets,
-               ROUND(AVG(resolution_hours), 1) as avg_hours
-        FROM {_tbl('v_support_tickets_clean')}
-        GROUP BY category ORDER BY tickets DESC
-    """)
-    fig = px.bar(res, x="category", y="tickets", color="avg_hours",
+    res = tickets.groupby("category", as_index=False).agg(
+        ticket_count=("category", "count"),
+        avg_hours=("resolution_hours", "mean")
+    ).sort_values("ticket_count", ascending=False)
+    res["avg_hours"] = res.avg_hours.round(1)
+    fig = px.bar(res, x="category", y="ticket_count", color="avg_hours",
                  color_continuous_scale="OrRd")
     style_fig(fig, height=350, title_text="Tickets by Category (color = avg resolution hrs)")
     st.plotly_chart(fig, use_container_width=True)
