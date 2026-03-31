@@ -4,6 +4,15 @@ Otacon Inc. — Analytics Portal
 Enterprise dashboard platform landing page.
 Each project card links to an independently deployed Cloud Run service.
 Add new entries to PROJECTS as you complete each week.
+
+TO DEPLOY:
+    1. Deploy week1_dashboard first, note the Cloud Run URL
+    2. Replace __WEEK1_URL__ below with that URL
+    3. Deploy this portal:
+           gcloud run deploy otacon-portal \
+             --source . \
+             --region us-central1 \
+             --allow-unauthenticated
 """
 
 import streamlit as st
@@ -218,7 +227,7 @@ for project in PROJECTS:
         st.link_button(f"Open Dashboard", project["url"], use_container_width=True)
     elif project["status"] == "live":
         st.caption(
-            "Replace __WEEK1_URL__ in app.py with your deployed Week 1 dashboard URL"
+            "Replace __WEEK1_URL__ in portal/app.py with your deployed Week 1 dashboard URL"
         )
 
 
