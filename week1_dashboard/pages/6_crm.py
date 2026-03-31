@@ -2,15 +2,13 @@
 import streamlit as st
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from db import q, _tbl, style_fig, governance_sidebar, COLORS
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from db import q, governance_sidebar, BLUE, GREEN, RED, ORANGE, PURPLE, GRAY, LIGHT_GRAY, DARK
+import altair as alt
 
 st.markdown("## CRM Pipeline")
 st.caption("Accounts, opportunities, sales activity | Clean views")
 
-# ── Query 1: KPIs ──
+# ── KPIs ──
 kpis = q("""
     SELECT
         (SELECT COUNT(*) FROM accounts) as accts,
@@ -31,94 +29,96 @@ c6.metric("Activities", f"{kpis.activities[0]:,}")
 
 st.divider()
 
-# ── Query 2: Opportunities ──
-opps = q("SELECT stage, amount, probability, product_interest FROM v_opportunities_clean")
-
+# ── 1. Funnel ──
 col1, col2 = st.columns(2)
 
 with col1:
-    stages = opps.groupby("stage", as_index=False).agg(
-        deals=("amount", "count"),
-        value=("amount", "sum"),
-        prob=("probability", "mean")
-    ).sort_values("prob")
-    fig = go.Figure(go.Funnel(
-        y=stages.stage, x=stages.deals, textinfo="value+percent initial",
-        marker_color=[COLORS["light_gray"], "#93c5fd", COLORS["blue"],
-                      "#1d4ed8", COLORS["green"], COLORS["red"]]
-    ))
-    style_fig(fig, height=400, title_text="Opportunity Funnel")
-    st.plotly_chart(fig, use_container_width=True)
+    stages = q("""
+        SELECT stage, COUNT(*) as deals, SUM(amount) as value, AVG(probability) as prob
+        FROM v_opportunities_clean GROUP BY stage ORDER BY prob
+    """)
+    chart = alt.Chart(stages).mark_bar(color=BLUE).encode(
+        x=alt.X("deals:Q", title="Deals"),
+        y=alt.Y("stage:N", title=None, sort=alt.EncodingSortField(field="prob", order="descending")),
+        color=alt.Color("prob:Q", scale=alt.Scale(scheme="blues"), title="Probability")
+    ).properties(title="Opportunity Funnel", height=380)
+    st.altair_chart(chart, use_container_width=True)
 
 with col2:
-    open_mask = ~opps.stage.isin(["closed_won", "closed_lost"])
-    won_mask = opps.stage == "closed_won"
-    open_val = opps[open_mask].groupby("product_interest", as_index=False).agg(open_val=("amount", "sum"))
-    won_val = opps[won_mask].groupby("product_interest", as_index=False).agg(won_val=("amount", "sum"))
-    by_prod = open_val.merge(won_val, on="product_interest", how="outer").fillna(0).sort_values("open_val", ascending=False)
-    fig = px.bar(by_prod, x="product_interest", y=["open_val", "won_val"],
-                 barmode="stack", color_discrete_sequence=[COLORS["blue"], COLORS["green"]],
-                 labels={"value": "Amount ($)", "variable": ""})
-    style_fig(fig, height=400, title_text="Pipeline by Product Interest")
-    fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
-    st.plotly_chart(fig, use_container_width=True)
+    by_prod = q("""
+        SELECT product_interest,
+               SUM(CASE WHEN stage NOT IN ('closed_won','closed_lost') THEN amount ELSE 0 END) as open_val,
+               SUM(CASE WHEN stage='closed_won' THEN amount ELSE 0 END) as won_val
+        FROM v_opportunities_clean GROUP BY product_interest ORDER BY open_val DESC
+    """)
+    import pandas as pd
+    melted = pd.melt(by_prod, id_vars=["product_interest"], value_vars=["open_val","won_val"],
+                     var_name="type", value_name="amount")
+    chart = alt.Chart(melted).mark_bar().encode(
+        x=alt.X("product_interest:N", title=None, sort=by_prod.product_interest.tolist()),
+        y=alt.Y("amount:Q", title="Amount ($)", stack=True),
+        color=alt.Color("type:N", scale=alt.Scale(domain=["open_val","won_val"], range=[BLUE, GREEN]))
+    ).properties(title="Pipeline by Product Interest", height=380)
+    st.altair_chart(chart, use_container_width=True)
 
-# ── Query 3: Accounts ──
+# ── 3 & 4. Account health ──
 st.divider()
 col1, col2 = st.columns(2)
 
-acct_data = q("SELECT health_score, account_tier FROM accounts")
-
 with col1:
-    fig = px.histogram(acct_data, x="health_score", color="account_tier", nbins=30,
-                       color_discrete_map={"strategic": COLORS["green"], "growth": COLORS["blue"],
-                                           "maintain": COLORS["orange"], "at_risk": COLORS["red"]},
-                       category_orders={"account_tier": ["strategic","growth","maintain","at_risk"]})
-    style_fig(fig, height=360, title_text="Health Score Distribution by Tier")
-    fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
-    st.plotly_chart(fig, use_container_width=True)
+    acct_data = q("SELECT health_score, account_tier FROM accounts")
+    tier_order = ["strategic","growth","maintain","at_risk"]
+    chart = alt.Chart(acct_data).mark_bar(opacity=0.7).encode(
+        x=alt.X("health_score:Q", bin=alt.Bin(maxbins=30), title="Health Score"),
+        y=alt.Y("count()", title="Accounts"),
+        color=alt.Color("account_tier:N",
+                         scale=alt.Scale(domain=tier_order, range=[GREEN, BLUE, ORANGE, RED]),
+                         sort=tier_order)
+    ).properties(title="Health Score Distribution by Tier", height=340)
+    st.altair_chart(chart, use_container_width=True)
 
 with col2:
-    tier = acct_data.groupby("account_tier", as_index=False).agg(
-        n=("health_score", "count"),
-        health=("health_score", "mean")
+    tier = q("SELECT account_tier, COUNT(*) as n, AVG(health_score) as health FROM accounts GROUP BY account_tier")
+    chart = alt.Chart(tier).mark_bar().encode(
+        x=alt.X("account_tier:N", title=None, sort=tier_order),
+        y=alt.Y("n:Q", title="Count"),
+        color=alt.Color("health:Q", scale=alt.Scale(scheme="redyellowgreen"), title="Avg Health")
+    ).properties(title="Accounts by Tier (color = avg health)", height=340)
+    text = alt.Chart(tier).mark_text(dy=-10, fontSize=12).encode(
+        x=alt.X("account_tier:N", sort=tier_order), y="n:Q", text="n:Q"
     )
-    fig = px.bar(tier, x="account_tier", y="n", color="health",
-                 color_continuous_scale="RdYlGn", text="n",
-                 category_orders={"account_tier": ["strategic","growth","maintain","at_risk"]})
-    style_fig(fig, height=360, title_text="Accounts by Tier (color = avg health)", showlegend=False)
-    fig.update_traces(textposition="outside")
-    st.plotly_chart(fig, use_container_width=True)
+    st.altair_chart(chart + text, use_container_width=True)
 
-# ── Query 4: Activities ──
+# ── 5. Activity volume over time ──
 st.divider()
 
-activities = q("""
-    SELECT activity_id, activity_date,
-           strftime('%Y-%m', activity_date) as month,
-           activity_type, outcome, account_id
-    FROM v_activities_clean
+act = q("""
+    SELECT strftime('%Y-%m', activity_date) as month, activity_type, COUNT(*) as n
+    FROM v_activities_clean GROUP BY month, activity_type ORDER BY month
 """)
+chart = alt.Chart(act).mark_area().encode(
+    x=alt.X("month:O", title=None, axis=alt.Axis(labelAngle=-45, values=act.month.unique().tolist()[::3])),
+    y=alt.Y("n:Q", title="Activities", stack=True),
+    color="activity_type:N"
+).properties(title="Monthly CRM Activity by Type", height=360)
+st.altair_chart(chart, use_container_width=True)
 
-act_mo = activities.groupby(["month", "activity_type"]).size().reset_index(name="n")
-fig = px.area(act_mo, x="month", y="n", color="activity_type",
-              color_discrete_sequence=[COLORS["blue"], COLORS["green"],
-                                       COLORS["purple"], COLORS["orange"], COLORS["red"]])
-style_fig(fig, height=380, title_text="Monthly CRM Activity by Type")
-fig.update_xaxes(dtick=3)
-fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
-st.plotly_chart(fig, use_container_width=True)
-
+# ── 6 & 7. Outcomes + rep leaderboard ──
 col1, col2 = st.columns(2)
 
 with col1:
-    outcomes = activities.groupby(["activity_type", "outcome"]).size().reset_index(name="n")
-    fig = px.bar(outcomes, x="activity_type", y="n", color="outcome", barmode="stack",
-                 color_discrete_map={"positive": COLORS["green"], "neutral": COLORS["gray"],
-                                     "negative": COLORS["red"], "follow_up_needed": COLORS["orange"]})
-    style_fig(fig, height=360, title_text="Activity Outcomes")
-    fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
-    st.plotly_chart(fig, use_container_width=True)
+    outcomes = q("""
+        SELECT activity_type, outcome, COUNT(*) as n
+        FROM v_activities_clean GROUP BY activity_type, outcome
+    """)
+    chart = alt.Chart(outcomes).mark_bar().encode(
+        x=alt.X("activity_type:N", title=None),
+        y=alt.Y("n:Q", title="Count", stack=True),
+        color=alt.Color("outcome:N",
+                         scale=alt.Scale(domain=["positive","neutral","negative","follow_up_needed"],
+                                         range=[GREEN, GRAY, RED, ORANGE]))
+    ).properties(title="Activity Outcomes", height=340)
+    st.altair_chart(chart, use_container_width=True)
 
 with col2:
     reps = q("""
@@ -129,10 +129,11 @@ with col2:
         JOIN accounts a2 ON act.account_id = a2.account_id
         GROUP BY rep ORDER BY activities DESC
     """)
-    fig = px.bar(reps, x="rep", y="activities", color="win_rate",
-                 color_continuous_scale="Greens")
-    style_fig(fig, height=360, title_text="Sales Rep Activity (color = positive rate %)")
-    fig.update_xaxes(tickangle=-45)
-    st.plotly_chart(fig, use_container_width=True)
+    chart = alt.Chart(reps).mark_bar().encode(
+        x=alt.X("rep:N", title=None, sort="-y", axis=alt.Axis(labelAngle=-45)),
+        y=alt.Y("activities:Q", title="Activities"),
+        color=alt.Color("win_rate:Q", scale=alt.Scale(scheme="greens"), title="Positive %")
+    ).properties(title="Sales Rep Activity (color = positive rate %)", height=340)
+    st.altair_chart(chart, use_container_width=True)
 
 governance_sidebar("activities", "v_activities_clean", ["activities"])

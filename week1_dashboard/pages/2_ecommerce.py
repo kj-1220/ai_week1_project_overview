@@ -2,168 +2,167 @@
 import streamlit as st
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from db import q, _tbl, style_fig, governance_sidebar, COLORS, REGION_COLORS
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from db import q, governance_sidebar, BLUE, GREEN, RED, ORANGE, PURPLE, GRAY, LIGHT_GRAY
+import altair as alt
 
 st.markdown("## E-Commerce")
 st.caption("Orders, revenue, product mix, returns | Clean views")
 
-# ── Query 1: All orders ──
-orders = q("""
-    SELECT order_date,
-           strftime('%Y-%m', order_date) as month,
-           CAST(strftime('%Y', order_date) AS INTEGER) as year,
-           ((CAST(strftime('%m', order_date) AS INTEGER) - 1) / 3 + 1) as quarter,
-           CAST(strftime('%m', order_date) AS INTEGER) as mo,
-           total_amount, discount_pct
-    FROM v_orders_clean
+# ── KPIs ──
+kpis = q("""
+    SELECT
+        (SELECT SUM(total_amount) FROM v_orders_clean) as total_rev,
+        (SELECT COUNT(*) FROM v_orders_clean) as total_orders,
+        (SELECT AVG(discount_pct)*100 FROM v_orders_clean) as avg_disc,
+        (SELECT COUNT(*) FROM v_returns_clean) as returns
 """)
-
-total_rev = orders.total_amount.sum()
-total_orders = len(orders)
-aov = total_rev / total_orders
-avg_disc = orders.discount_pct.mean() * 100
-
-# ── Query 2: Returns ──
-returns_df = q("""
-    SELECT return_date, strftime('%Y-%m', return_date) as month, reason
-    FROM v_returns_clean
-""")
-return_rate = len(returns_df) / total_orders * 100
+total_rev = kpis.total_rev[0]
+total_orders = kpis.total_orders[0]
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Revenue", f"${total_rev/1e6:.1f}M")
 c2.metric("Orders", f"{total_orders:,}")
-c3.metric("Avg Order Value", f"${aov:,.0f}")
-c4.metric("Return Rate", f"{return_rate:.1f}%")
-c5.metric("Avg Discount", f"{avg_disc:.1f}%")
+c3.metric("Avg Order Value", f"${total_rev/total_orders:,.0f}")
+c4.metric("Return Rate", f"{kpis.returns[0]/total_orders*100:.1f}%")
+c5.metric("Avg Discount", f"{kpis.avg_disc[0]:.1f}%")
 
 st.divider()
 
-# ── 1. Revenue and volume trend (dual axis) ──
-monthly = orders.groupby("month", as_index=False).agg(
-    revenue=("total_amount", "sum"),
-    order_count=("total_amount", "count"),
-    aov=("total_amount", "mean")
-)
+# ── 1. Revenue and order volume ──
+monthly = q("""
+    SELECT strftime('%Y-%m', order_date) as month,
+           SUM(total_amount) as revenue, COUNT(*) as orders
+    FROM v_orders_clean GROUP BY month ORDER BY month
+""")
 
-fig = make_subplots(specs=[[{"secondary_y": True}]])
-fig.add_trace(go.Bar(x=monthly.month, y=monthly.order_count, name="Orders",
-                     marker_color=COLORS["light_gray"], opacity=0.6),
-              secondary_y=False)
-fig.add_trace(go.Scatter(x=monthly.month, y=monthly.revenue, name="Revenue",
-                         mode="lines", line=dict(color=COLORS["blue"], width=2.5)),
-              secondary_y=True)
-style_fig(fig, height=400, title_text="Monthly Revenue and Order Volume")
-fig.update_yaxes(title_text="Orders", secondary_y=False)
-fig.update_yaxes(title_text="Revenue ($)", secondary_y=True)
-fig.update_xaxes(dtick=3)
-fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
-st.plotly_chart(fig, use_container_width=True)
+base = alt.Chart(monthly).encode(x=alt.X("month:O", title=None, axis=alt.Axis(labelAngle=-45, values=monthly.month.tolist()[::3])))
+bars = base.mark_bar(color=LIGHT_GRAY, opacity=0.6).encode(y=alt.Y("orders:Q", title="Orders"))
+line = base.mark_line(color=BLUE, strokeWidth=2.5).encode(y=alt.Y("revenue:Q", title="Revenue ($)"))
+chart = alt.layer(bars, line).resolve_scale(y="independent").properties(title="Monthly Revenue and Order Volume", height=380)
+st.altair_chart(chart, use_container_width=True)
 
-# ── 2. Quarterly revenue heatmap ──
+# ── 2. Quarterly heatmap & 3. Seasonality ──
 col1, col2 = st.columns([1.2, 1])
 
 with col1:
-    orders["year_str"] = orders.year.astype(str)
-    orders["qtr_str"] = "Q" + orders.quarter.astype(str)
-    qtr = orders.groupby(["year_str", "qtr_str"], as_index=False).agg(revenue=("total_amount", "sum"))
-    pivot = qtr.pivot(index="year_str", columns="qtr_str", values="revenue")
-    fig = px.imshow(pivot / 1e6, text_auto=".0f", color_continuous_scale="Blues",
-                    labels={"color": "Revenue ($M)"})
-    style_fig(fig, height=280, title_text="Quarterly Revenue ($M)")
-    st.plotly_chart(fig, use_container_width=True)
+    qtr = q("""
+        SELECT CAST(strftime('%Y', order_date) AS TEXT) as year,
+               'Q' || ((CAST(strftime('%m', order_date) AS INTEGER) - 1) / 3 + 1) as quarter,
+               ROUND(SUM(total_amount) / 1000000.0, 0) as rev_m
+        FROM v_orders_clean GROUP BY year, quarter ORDER BY year, quarter
+    """)
+    chart = alt.Chart(qtr).mark_rect().encode(
+        x=alt.X("quarter:O", title=None),
+        y=alt.Y("year:O", title=None),
+        color=alt.Color("rev_m:Q", scale=alt.Scale(scheme="blues"), title="Revenue ($M)")
+    ).properties(title="Quarterly Revenue ($M)", height=260)
+    text = alt.Chart(qtr).mark_text(fontSize=12).encode(
+        x="quarter:O", y="year:O", text=alt.Text("rev_m:Q", format=".0f"),
+        color=alt.condition(alt.datum.rev_m > qtr.rev_m.median(), alt.value("white"), alt.value("black"))
+    )
+    st.altair_chart(chart + text, use_container_width=True)
 
 with col2:
-    mo_counts = orders.groupby("mo").size().reset_index(name="order_count").sort_values("mo")
-    avg = mo_counts.order_count.mean()
-    mo_counts["mult"] = (mo_counts.order_count / avg).round(2)
-    month_names = {1:"J",2:"F",3:"M",4:"A",5:"M",6:"J",7:"J",8:"A",9:"S",10:"O",11:"N",12:"D"}
-    mo_counts["label"] = mo_counts.mo.map(month_names)
+    mo = q("""
+        SELECT CAST(strftime('%m', order_date) AS INTEGER) as mo, COUNT(*) as orders
+        FROM v_orders_clean GROUP BY mo ORDER BY mo
+    """)
+    avg = mo.orders.mean()
+    mo["mult"] = (mo.orders / avg).round(2)
+    names = {1:"J",2:"F",3:"M",4:"A",5:"M",6:"J",7:"J",8:"A",9:"S",10:"O",11:"N",12:"D"}
+    mo["label"] = mo.mo.map(names)
 
-    fig = px.bar(mo_counts, x="label", y="mult", color_discrete_sequence=[COLORS["blue"]],
-                 text="mult")
-    fig.add_hline(y=1.0, line_dash="dot", line_color=COLORS["gray"])
-    style_fig(fig, height=280, title_text="Monthly Seasonality Index")
-    fig.update_traces(textposition="outside", textfont_size=10)
-    fig.update_yaxes(title_text="Multiplier")
-    st.plotly_chart(fig, use_container_width=True)
+    chart = alt.Chart(mo).mark_bar(color=BLUE).encode(
+        x=alt.X("label:N", title=None, sort=list(names.values())),
+        y=alt.Y("mult:Q", title="Multiplier")
+    ).properties(title="Monthly Seasonality Index", height=260)
+    rule = alt.Chart(mo).mark_rule(color=GRAY, strokeDash=[4, 4]).encode(y=alt.datum(1.0))
+    text = alt.Chart(mo).mark_text(dy=-10, fontSize=10).encode(
+        x=alt.X("label:N", sort=list(names.values())), y="mult:Q", text=alt.Text("mult:Q", format=".2f")
+    )
+    st.altair_chart(chart + rule + text, use_container_width=True)
 
 st.divider()
 
-# ── Query 3: Product-level data ──
-items = q("""
-    SELECT oi.line_total, oi.order_id, oi.product_id,
-           strftime('%Y-%m', o.order_date) as month,
-           CAST(strftime('%Y', o.order_date) AS INTEGER) as year,
-           CAST(strftime('%m', o.order_date) AS INTEGER) as mo,
-           p.category, p.subcategory
-    FROM v_order_items_clean oi
-    JOIN v_orders_clean o ON oi.order_id = o.order_id
-    JOIN products p ON oi.product_id = p.product_id
-""")
-
-# ── 4. Q2 tariff impact by category ──
+# ── 4. Q2 tariff impact & 5. Revenue by category ──
 col1, col2 = st.columns(2)
 
 with col1:
-    q2 = items[items.mo.between(4, 6)]
-    tariff = q2.groupby(["year", "category"], as_index=False).agg(revenue=("line_total", "sum"))
-    tariff["year"] = tariff["year"].astype(str)
-    fig = px.bar(tariff, x="category", y="revenue", color="year", barmode="group",
-                 color_discrete_sequence=[COLORS["light_gray"], COLORS["blue"], COLORS["red"]])
-    style_fig(fig, height=380, title_text="Q2 Revenue by Category — Year over Year")
-    fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
-    st.plotly_chart(fig, use_container_width=True)
+    tariff = q("""
+        SELECT CAST(strftime('%Y', o.order_date) AS TEXT) as year, p.category,
+               SUM(oi.line_total) as revenue
+        FROM v_order_items_clean oi
+        JOIN v_orders_clean o ON oi.order_id = o.order_id
+        JOIN products p ON oi.product_id = p.product_id
+        WHERE CAST(strftime('%m', o.order_date) AS INTEGER) BETWEEN 4 AND 6
+        GROUP BY year, category ORDER BY year, category
+    """)
+    chart = alt.Chart(tariff).mark_bar().encode(
+        x=alt.X("category:N", title=None),
+        y=alt.Y("revenue:Q", title="Revenue ($)"),
+        color=alt.Color("year:N", scale=alt.Scale(range=[LIGHT_GRAY, BLUE, RED])),
+        xOffset="year:N"
+    ).properties(title="Q2 Revenue by Category — YoY", height=360)
+    st.altair_chart(chart, use_container_width=True)
 
 with col2:
-    cat = items.groupby(["month", "category"], as_index=False).agg(revenue=("line_total", "sum"))
-    fig = px.line(cat, x="month", y="revenue", color="category",
-                  color_discrete_sequence=[COLORS["blue"], COLORS["green"],
-                                           COLORS["purple"], COLORS["orange"], COLORS["red"]])
-    style_fig(fig, height=380, title_text="Monthly Revenue by Category")
-    fig.update_xaxes(dtick=3)
-    fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
-    st.plotly_chart(fig, use_container_width=True)
+    cat = q("""
+        SELECT strftime('%Y-%m', o.order_date) as month, p.category,
+               SUM(oi.line_total) as revenue
+        FROM v_order_items_clean oi
+        JOIN v_orders_clean o ON oi.order_id = o.order_id
+        JOIN products p ON oi.product_id = p.product_id
+        GROUP BY month, category ORDER BY month
+    """)
+    chart = alt.Chart(cat).mark_line(strokeWidth=2).encode(
+        x=alt.X("month:O", title=None, axis=alt.Axis(labelAngle=-45, values=cat.month.unique().tolist()[::3])),
+        y=alt.Y("revenue:Q", title="Revenue ($)"),
+        color=alt.Color("category:N")
+    ).properties(title="Monthly Revenue by Category", height=360)
+    st.altair_chart(chart, use_container_width=True)
 
-# ── 6. Product treemap ──
-products = items.groupby(["category", "subcategory"], as_index=False).agg(
-    revenue=("line_total", "sum"),
-    orders=("order_id", "nunique")
-)
-fig = px.treemap(products, path=["category", "subcategory"], values="revenue",
-                 color="orders", color_continuous_scale="Blues")
-style_fig(fig, height=420, title_text="Revenue by Category and Subcategory")
-st.plotly_chart(fig, use_container_width=True)
+# ── 6. Product treemap (use bar chart — Altair doesn't have treemap) ──
+products = q("""
+    SELECT p.category, p.subcategory,
+           SUM(oi.line_total) as revenue
+    FROM v_order_items_clean oi
+    JOIN products p ON oi.product_id = p.product_id
+    GROUP BY p.category, p.subcategory ORDER BY revenue DESC
+    LIMIT 20
+""")
+chart = alt.Chart(products).mark_bar().encode(
+    x=alt.X("revenue:Q", title="Revenue ($)"),
+    y=alt.Y("subcategory:N", title=None, sort="-x"),
+    color=alt.Color("category:N")
+).properties(title="Top 20 Subcategories by Revenue", height=420)
+st.altair_chart(chart, use_container_width=True)
 
 # ── 7 & 8. Returns ──
 st.divider()
 col1, col2 = st.columns(2)
 
 with col1:
-    ret_mo = returns_df.groupby("month").size().reset_index(name="returns")
-    ord_mo = orders.groupby("month").size().reset_index(name="order_count")
-    merged = ret_mo.merge(ord_mo, on="month")
-    merged["rate"] = (merged.returns / merged.order_count * 100).round(2)
-
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Bar(x=merged.month, y=merged.returns, name="Returns",
-                         marker_color=COLORS["orange"], opacity=0.7), secondary_y=False)
-    fig.add_trace(go.Scatter(x=merged.month, y=merged.rate, name="Rate %",
-                             mode="lines", line=dict(color=COLORS["red"], width=2)),
-                  secondary_y=True)
-    style_fig(fig, height=350, title_text="Monthly Returns and Return Rate")
-    fig.update_layout(legend=dict(orientation="h", y=1.12, x=0))
-    st.plotly_chart(fig, use_container_width=True)
+    merged = q("""
+        SELECT r.month, r.returns, o.orders,
+               ROUND(CAST(r.returns AS REAL) / o.orders * 100, 2) as rate
+        FROM (SELECT strftime('%Y-%m', return_date) as month, COUNT(*) as returns
+              FROM v_returns_clean GROUP BY month) r
+        JOIN (SELECT strftime('%Y-%m', order_date) as month, COUNT(*) as orders
+              FROM v_orders_clean GROUP BY month) o ON r.month = o.month
+        ORDER BY r.month
+    """)
+    base = alt.Chart(merged).encode(x=alt.X("month:O", title=None, axis=alt.Axis(labelAngle=-45, values=merged.month.tolist()[::3])))
+    bars = base.mark_bar(color=ORANGE, opacity=0.7).encode(y=alt.Y("returns:Q", title="Returns"))
+    line = base.mark_line(color=RED, strokeWidth=2).encode(y=alt.Y("rate:Q", title="Rate %"))
+    chart = alt.layer(bars, line).resolve_scale(y="independent").properties(title="Monthly Returns and Return Rate", height=330)
+    st.altair_chart(chart, use_container_width=True)
 
 with col2:
-    reasons = returns_df.groupby("reason").size().reset_index(name="n").sort_values("n", ascending=False)
-    fig = px.bar(reasons, x="n", y="reason", orientation="h",
-                 color_discrete_sequence=[COLORS["orange"]])
-    style_fig(fig, height=350, title_text="Return Reasons")
-    fig.update_traces(texttemplate="%{x:,}", textposition="outside")
-    st.plotly_chart(fig, use_container_width=True)
+    reasons = q("SELECT reason, COUNT(*) as n FROM v_returns_clean GROUP BY reason ORDER BY n DESC")
+    chart = alt.Chart(reasons).mark_bar(color=ORANGE).encode(
+        x=alt.X("n:Q", title="Count"),
+        y=alt.Y("reason:N", title=None, sort="-x")
+    ).properties(title="Return Reasons", height=330)
+    st.altair_chart(chart, use_container_width=True)
 
 governance_sidebar("orders", "v_orders_clean", ["customers", "orders", "order_items"])

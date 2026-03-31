@@ -2,15 +2,10 @@
 Otacon Inc. — Analytics Dashboard
 Page 1: Executive Summary
 """
-
 import streamlit as st
 
-st.set_page_config(
-    page_title="Otacon Inc.",
-    page_icon="O",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Otacon Inc.", page_icon="O", layout="wide",
+                   initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
@@ -22,17 +17,15 @@ st.markdown("""
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from db import q, _tbl, style_fig, COLORS, REGION_COLORS
-
-import plotly.express as px
-import plotly.graph_objects as go
+from db import q, BLUE, GREEN, RED, ORANGE, PURPLE, GRAY, DARK
+import altair as alt
 
 # ── Sidebar ──
 st.sidebar.markdown("### Otacon Inc.")
 st.sidebar.caption("Analytics Dashboard")
 st.sidebar.divider()
 
-# ── All KPIs in one query ──
+# ── KPIs ──
 st.markdown("## Executive Summary")
 st.caption("Otacon Inc. | 2023 – 2025 | Clean governed views")
 
@@ -56,100 +49,103 @@ c6.metric("Open Pipeline", f"${kpis.pipeline[0]/1e6:.1f}M")
 
 st.divider()
 
-# ── Revenue trend + YoY + region in one query ──
+# ── Revenue trend ──
 col_chart, col_yoy = st.columns([2.5, 1])
 
-rev = q("""
+monthly_rev = q("""
     SELECT strftime('%Y-%m', order_date) as month,
-           CAST(strftime('%Y', order_date) AS INTEGER) as year,
-           region,
-           SUM(total_amount) as revenue,
-           COUNT(*) as orders
-    FROM v_orders_clean GROUP BY month, year, region ORDER BY month
+           SUM(total_amount) as revenue, COUNT(*) as orders
+    FROM v_orders_clean GROUP BY month ORDER BY month
 """)
 
 with col_chart:
-    monthly = rev.groupby("month", as_index=False).agg({"revenue": "sum", "orders": "sum"})
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=monthly.month, y=monthly.revenue, mode="lines",
-                             line=dict(color=COLORS["blue"], width=2),
-                             fill="tozeroy", fillcolor="rgba(37,99,235,0.06)"))
-    style_fig(fig, height=360, title_text="Monthly Revenue")
-    fig.update_xaxes(dtick=3)
-    st.plotly_chart(fig, use_container_width=True)
+    chart = alt.Chart(monthly_rev).mark_area(
+        line={"color": BLUE, "strokeWidth": 2},
+        color=alt.Gradient(gradient="linear", stops=[
+            alt.GradientStop(color=BLUE, offset=1),
+            alt.GradientStop(color="rgba(37,99,235,0.05)", offset=0)
+        ], x1=1, x2=1, y1=1, y2=0)
+    ).encode(
+        x=alt.X("month:O", title=None, axis=alt.Axis(labelAngle=-45, values=monthly_rev.month.tolist()[::3])),
+        y=alt.Y("revenue:Q", title="Revenue ($)")
+    ).properties(title="Monthly Revenue", height=340)
+    st.altair_chart(chart, use_container_width=True)
 
 with col_yoy:
-    yoy = rev.groupby("year", as_index=False).agg({"revenue": "sum"})
+    yoy = q("""
+        SELECT CAST(strftime('%Y', order_date) AS INTEGER) as year,
+               SUM(total_amount) as revenue
+        FROM v_orders_clean GROUP BY year ORDER BY year
+    """)
     yoy["growth"] = yoy.revenue.pct_change() * 100
 
     st.markdown("**Annual Revenue**")
     for _, r in yoy.iterrows():
-        yr = int(r.year)
         growth = f" ({r.growth:+.1f}%)" if r.growth == r.growth else ""
-        st.text(f"  {yr}:  ${r.revenue/1e6:.1f}M{growth}")
+        st.text(f"  {int(r.year)}:  ${r.revenue/1e6:.1f}M{growth}")
 
     st.markdown("")
     st.markdown("**By Region**")
-    region_rev = rev.groupby("region", as_index=False).agg({"revenue": "sum"}).sort_values("revenue", ascending=False)
-    total = region_rev.revenue.sum()
+    region_rev = q("SELECT region, SUM(total_amount) as rev FROM v_orders_clean GROUP BY region ORDER BY rev DESC")
+    total = region_rev.rev.sum()
     for _, r in region_rev.iterrows():
-        pct = r.revenue / total * 100
-        st.text(f"  {r.region}: {pct:.0f}%")
+        st.text(f"  {r.region}: {r.rev / total * 100:.0f}%")
 
-# ── Customer distributions in one query ──
+# ── Customer distributions ──
 st.divider()
 col1, col2, col3 = st.columns(3)
 
-cust = q("SELECT segment, industry, status FROM v_customers_clean")
-
 with col1:
-    seg = cust.groupby("segment").size().reset_index(name="n").sort_values("n", ascending=False)
-    fig = px.bar(seg, x="segment", y="n", color="segment",
-                 color_discrete_map={"enterprise":"#7c3aed","mid_market":"#2563eb","smb":"#16a34a"})
-    style_fig(fig, height=300, title_text="Customers by Segment", showlegend=False)
-    fig.update_traces(texttemplate="%{y:,}", textposition="outside")
-    st.plotly_chart(fig, use_container_width=True)
+    seg = q("SELECT segment, COUNT(*) as n FROM v_customers_clean GROUP BY segment ORDER BY n DESC")
+    chart = alt.Chart(seg).mark_bar().encode(
+        x=alt.X("segment:N", title=None, sort="-y"),
+        y=alt.Y("n:Q", title="Count"),
+        color=alt.Color("segment:N", scale=alt.Scale(domain=["enterprise","mid_market","smb"],
+                         range=["#7c3aed","#2563eb","#16a34a"]), legend=None)
+    ).properties(title="Customers by Segment", height=280)
+    st.altair_chart(chart, use_container_width=True)
 
 with col2:
-    ind = cust.groupby("industry").size().reset_index(name="n").sort_values("n", ascending=False)
-    fig = px.bar(ind, x="n", y="industry", orientation="h", color_discrete_sequence=[COLORS["blue"]])
-    style_fig(fig, height=300, title_text="Customers by Industry")
-    fig.update_traces(texttemplate="%{x:,}", textposition="outside")
-    st.plotly_chart(fig, use_container_width=True)
+    ind = q("SELECT industry, COUNT(*) as n FROM v_customers_clean GROUP BY industry ORDER BY n DESC")
+    chart = alt.Chart(ind).mark_bar().encode(
+        y=alt.Y("industry:N", title=None, sort="-x"),
+        x=alt.X("n:Q", title="Count"),
+        color=alt.value(BLUE)
+    ).properties(title="Customers by Industry", height=280)
+    st.altair_chart(chart, use_container_width=True)
 
 with col3:
-    status = cust.groupby("status").size().reset_index(name="n").sort_values("n", ascending=False)
-    fig = px.pie(status, names="status", values="n", hole=0.5,
-                 color="status", color_discrete_map={"active":"#16a34a","churned":"#dc2626","suspended":"#ea580c"})
-    style_fig(fig, height=300, title_text="Customer Status")
-    fig.update_traces(textinfo="percent+label", textfont_size=11)
-    st.plotly_chart(fig, use_container_width=True)
+    status = q("SELECT status, COUNT(*) as n FROM v_customers_clean GROUP BY status ORDER BY n DESC")
+    chart = alt.Chart(status).mark_arc(innerRadius=50).encode(
+        theta=alt.Theta("n:Q"),
+        color=alt.Color("status:N", scale=alt.Scale(domain=["active","churned","suspended"],
+                         range=[GREEN, RED, ORANGE]), legend=alt.Legend(orient="bottom"))
+    ).properties(title="Customer Status", height=280)
+    st.altair_chart(chart, use_container_width=True)
 
 # ── Customer 360 ──
 st.divider()
 st.markdown("#### Customer 360")
 tab1, tab2 = st.tabs(["Top 10 by Lifetime Value", "Bottom 10 by Health Score"])
 
-c360 = q("""
-    SELECT company_name, region, segment, total_orders,
-           ROUND(total_revenue, 0) as revenue,
-           saas_plan, account_health,
-           ROUND(lifetime_value, 0) as ltv,
-           ROUND(late_payment_pct * 100, 1) as late_pct,
-           total_returns, return_rate
-    FROM customer_360
-""")
-
 with tab1:
-    top = c360[c360.ltv > 0].nlargest(10, "ltv")[
-        ["company_name", "region", "segment", "total_orders", "revenue", "saas_plan", "account_health", "ltv"]
-    ]
+    top = q("""
+        SELECT company_name, region, segment, total_orders,
+               ROUND(total_revenue, 0) as revenue, saas_plan, account_health,
+               ROUND(lifetime_value, 0) as ltv
+        FROM customer_360 WHERE lifetime_value > 0
+        ORDER BY lifetime_value DESC LIMIT 10
+    """)
     st.dataframe(top, use_container_width=True, hide_index=True)
 
 with tab2:
-    bottom = c360[c360.account_health.notna()].nsmallest(10, "account_health")[
-        ["company_name", "region", "segment", "account_health", "saas_plan", "late_pct", "total_returns", "return_rate"]
-    ]
+    bottom = q("""
+        SELECT company_name, region, segment, account_health,
+               saas_plan, ROUND(late_payment_pct * 100, 1) as late_pct,
+               total_returns, return_rate
+        FROM customer_360 WHERE account_health IS NOT NULL
+        ORDER BY account_health ASC LIMIT 10
+    """)
     st.dataframe(bottom, use_container_width=True, hide_index=True)
 
 # ── Sidebar: data quality ──
